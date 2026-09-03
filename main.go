@@ -4,15 +4,16 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 )
 
-// Gestore del terminale con supporto al ridisegno concorrente
 type TerminalManager struct {
 	mu       sync.Mutex
 	inputBuf []rune
@@ -40,13 +41,33 @@ func (tm *TerminalManager) Restore() {
 	}
 }
 
-// Cancella la riga corrente, stampa il messaggio remoto e ripristina l'input locale
+// Cancella l'input a schermo (anche se è andato a capo su più righe)
+func (tm *TerminalManager) clearInputLineLocked() {
+	width, _, err := term.GetSize(tm.stdinFd)
+	if err != nil || width <= 0 {
+		width = 80
+	}
+
+	// Calcola quante righe occupa l'input attuale ("0> " + testo)
+	promptLen := 3
+	totalLen := promptLen + len(string(tm.inputBuf))
+	rows := (totalLen + width - 1) / width
+	if rows == 0 {
+		rows = 1
+	}
+
+	// Riposiziona il cursore all'inizio dell'input e cancella verso il basso
+	for i := 1; i < rows; i++ {
+		fmt.Print("\033[F") // Sale di una riga
+	}
+	fmt.Print("\r\033[J") // Cancella da inizio riga fino in fondo allo schermo
+}
+
 func (tm *TerminalManager) PrintIncoming(msg string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	// Sequenza ANSI: \r torna a inizio riga, \033[K cancella da lì a fine riga
-	fmt.Print("\r\033[K")
+	tm.clearInputLineLocked()
 	fmt.Printf("<0 %s\r\n", msg)
 	fmt.Printf("0> %s", string(tm.inputBuf))
 }
@@ -108,14 +129,20 @@ func handleChat(conn net.Conn) {
 	defer tm.Restore()
 
 	done := make(chan struct{})
+	var closeOnce sync.Once
+	safeClose := func() {
+		closeOnce.Do(func() {
+			close(done)
+		})
+	}
 
-	// Goroutine per la lettura dalla rete
+	// Goroutine Lettura Rete
 	go func() {
+		defer safeClose()
 		reader := bufio.NewReader(conn)
 		for {
 			msg, err := reader.ReadString('\n')
 			if err != nil {
-				close(done)
 				return
 			}
 			msg = strings.TrimRight(msg, "\r\n")
@@ -125,27 +152,38 @@ func handleChat(conn net.Conn) {
 		}
 	}()
 
-	// Goroutine per la lettura dell'input utente (carattere per carattere)
+	// Goroutine Lettura Input Utente (Stream di byte / UTF-8)
 	go func() {
+		defer safeClose()
 		fmt.Print("0> ")
-		buf := make([]byte, 3)
+
+		buf := make([]byte, 1024)
+		var pending []byte
 
 		for {
 			n, err := os.Stdin.Read(buf)
-			if err != nil {
-				close(done)
+			if err != nil && err != io.EOF {
+				return
+			}
+			if n == 0 {
 				return
 			}
 
-			if n == 1 {
-				b := buf[0]
+			pending = append(pending, buf[:n]...)
 
-				switch b {
+			for len(pending) > 0 {
+				r, size := utf8.DecodeRune(pending)
+				if r == utf8.RuneError && size == 1 && !utf8.FullRune(pending) {
+					// Attende altri byte per completare il carattere UTF-8
+					break
+				}
+				pending = pending[size:]
+
+				switch r {
 				case 3: // Ctrl+C
-					close(done)
 					return
 
-				case 13, 10: // Enter (\r o \n)
+				case '\r', '\n': // Invio
 					tm.mu.Lock()
 					line := string(tm.inputBuf)
 					tm.inputBuf = tm.inputBuf[:0]
@@ -153,9 +191,8 @@ func handleChat(conn net.Conn) {
 					tm.mu.Unlock()
 
 					if strings.TrimSpace(line) != "" {
-						_, err := conn.Write([]byte(line + "\n"))
-						if err != nil {
-							close(done)
+						_, writeErr := conn.Write([]byte(line + "\n"))
+						if writeErr != nil {
 							return
 						}
 					}
@@ -164,15 +201,16 @@ func handleChat(conn net.Conn) {
 					tm.mu.Lock()
 					if len(tm.inputBuf) > 0 {
 						tm.inputBuf = tm.inputBuf[:len(tm.inputBuf)-1]
-						fmt.Print("\r\033[K0> " + string(tm.inputBuf))
+						tm.clearInputLineLocked()
+						fmt.Printf("0> %s", string(tm.inputBuf))
 					}
 					tm.mu.Unlock()
 
-				default: // Caratteri stampabili
-					if b >= 32 {
+				default:
+					if r >= 32 {
 						tm.mu.Lock()
-						tm.inputBuf = append(tm.inputBuf, rune(b))
-						fmt.Print(string(b))
+						tm.inputBuf = append(tm.inputBuf, r)
+						fmt.Print(string(r))
 						tm.mu.Unlock()
 					}
 				}
