@@ -11,6 +11,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/rivo/uniseg"
 	"golang.org/x/term"
 )
 
@@ -41,26 +42,34 @@ func (tm *TerminalManager) Restore() {
 	}
 }
 
-// Cancella l'input a schermo (anche se è andato a capo su più righe)
+// CalculateRows determina quante righe occupano la stringa nel terminale in base alla larghezza dello schermo.
+func CalculateRows(promptAndText string, termWidth int) int {
+	if termWidth <= 0 {
+		termWidth = 80
+	}
+	// Calcola le colonne visive effettive (non i byte)
+	displayWidth := uniseg.StringWidth(promptAndText)
+	if displayWidth == 0 {
+		return 1
+	}
+	return (displayWidth + termWidth - 1) / termWidth
+}
+
+// Cancella l'input a schermo basandosi sui caratteri visivi reali
 func (tm *TerminalManager) clearInputLineLocked() {
 	width, _, err := term.GetSize(tm.stdinFd)
 	if err != nil || width <= 0 {
 		width = 80
 	}
 
-	// Calcola quante righe occupa l'input attuale ("0> " + testo)
-	promptLen := 3
-	totalLen := promptLen + len(string(tm.inputBuf))
-	rows := (totalLen + width - 1) / width
-	if rows == 0 {
-		rows = 1
-	}
+	fullLine := "0> " + string(tm.inputBuf)
+	rows := CalculateRows(fullLine, width)
 
 	// Riposiziona il cursore all'inizio dell'input e cancella verso il basso
 	for i := 1; i < rows; i++ {
 		fmt.Print("\033[F") // Sale di una riga
 	}
-	fmt.Print("\r\033[J") // Cancella da inizio riga fino in fondo allo schermo
+	fmt.Print("\r\033[J") // Cancella da inizio riga a fondo schermo
 }
 
 func (tm *TerminalManager) PrintIncoming(msg string) {
@@ -136,7 +145,6 @@ func handleChat(conn net.Conn) {
 		})
 	}
 
-	// Goroutine Lettura Rete
 	go func() {
 		defer safeClose()
 		reader := bufio.NewReader(conn)
@@ -152,7 +160,6 @@ func handleChat(conn net.Conn) {
 		}
 	}()
 
-	// Goroutine Lettura Input Utente (Stream di byte / UTF-8)
 	go func() {
 		defer safeClose()
 		fmt.Print("0> ")
@@ -174,7 +181,6 @@ func handleChat(conn net.Conn) {
 			for len(pending) > 0 {
 				r, size := utf8.DecodeRune(pending)
 				if r == utf8.RuneError && size == 1 && !utf8.FullRune(pending) {
-					// Attende altri byte per completare il carattere UTF-8
 					break
 				}
 				pending = pending[size:]
@@ -183,7 +189,7 @@ func handleChat(conn net.Conn) {
 				case 3: // Ctrl+C
 					return
 
-				case '\r', '\n': // Invio
+				case '\r', '\n':
 					tm.mu.Lock()
 					line := string(tm.inputBuf)
 					tm.inputBuf = tm.inputBuf[:0]
