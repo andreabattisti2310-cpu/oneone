@@ -49,8 +49,23 @@ func terminalRows(prompt string, input []rune, width int) int {
 		width = 80
 	}
 
-	columns := uniseg.StringWidth(prompt + string(input))
-	return max(1, (columns+width-1)/width)
+	rows := 1
+	column := 0
+	graphemes := uniseg.NewGraphemes(prompt + string(input))
+	for graphemes.Next() {
+		clusterWidth := graphemes.Width()
+		if clusterWidth <= 0 {
+			continue
+		}
+
+		if column > 0 && column+clusterWidth > width {
+			rows++
+			column = 0
+		}
+		column += clusterWidth
+	}
+
+	return rows
 }
 
 // Cancella l'input a schermo (anche se è andato a capo su più righe)
