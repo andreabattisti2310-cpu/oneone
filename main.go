@@ -11,8 +11,11 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/rivo/uniseg"
 	"golang.org/x/term"
 )
+
+const terminalPrompt = "0> "
 
 type TerminalManager struct {
 	mu       sync.Mutex
@@ -41,6 +44,30 @@ func (tm *TerminalManager) Restore() {
 	}
 }
 
+func terminalRows(prompt string, input []rune, width int) int {
+	if width <= 0 {
+		width = 80
+	}
+
+	rows := 1
+	column := 0
+	graphemes := uniseg.NewGraphemes(prompt + string(input))
+	for graphemes.Next() {
+		clusterWidth := graphemes.Width()
+		if clusterWidth <= 0 {
+			continue
+		}
+
+		if column > 0 && column+clusterWidth > width {
+			rows++
+			column = 0
+		}
+		column += clusterWidth
+	}
+
+	return rows
+}
+
 // Cancella l'input a schermo (anche se è andato a capo su più righe)
 func (tm *TerminalManager) clearInputLineLocked() {
 	width, _, err := term.GetSize(tm.stdinFd)
@@ -48,13 +75,7 @@ func (tm *TerminalManager) clearInputLineLocked() {
 		width = 80
 	}
 
-	// Calcola quante righe occupa l'input attuale ("0> " + testo)
-	promptLen := 3
-	totalLen := promptLen + len(string(tm.inputBuf))
-	rows := (totalLen + width - 1) / width
-	if rows == 0 {
-		rows = 1
-	}
+	rows := terminalRows(terminalPrompt, tm.inputBuf, width)
 
 	// Riposiziona il cursore all'inizio dell'input e cancella verso il basso
 	for i := 1; i < rows; i++ {
@@ -69,7 +90,7 @@ func (tm *TerminalManager) PrintIncoming(msg string) {
 
 	tm.clearInputLineLocked()
 	fmt.Printf("<0 %s\r\n", msg)
-	fmt.Printf("0> %s", string(tm.inputBuf))
+	fmt.Printf("%s%s", terminalPrompt, string(tm.inputBuf))
 }
 
 func main() {
@@ -95,7 +116,7 @@ func startServer(port string) {
 	}
 	defer listener.Close()
 
-	fmt.Printf("Listening on 0.0.0.0:%s\r\n0> ", port)
+	fmt.Printf("Listening on 0.0.0.0:%s\r\n%s", port, terminalPrompt)
 
 	conn, err := listener.Accept()
 	if err != nil {
@@ -155,7 +176,7 @@ func handleChat(conn net.Conn) {
 	// Goroutine Lettura Input Utente (Stream di byte / UTF-8)
 	go func() {
 		defer safeClose()
-		fmt.Print("0> ")
+		fmt.Print(terminalPrompt)
 
 		buf := make([]byte, 1024)
 		var pending []byte
@@ -187,7 +208,7 @@ func handleChat(conn net.Conn) {
 					tm.mu.Lock()
 					line := string(tm.inputBuf)
 					tm.inputBuf = tm.inputBuf[:0]
-					fmt.Print("\r\n0> ")
+					fmt.Printf("\r\n%s", terminalPrompt)
 					tm.mu.Unlock()
 
 					if strings.TrimSpace(line) != "" {
@@ -202,7 +223,7 @@ func handleChat(conn net.Conn) {
 					if len(tm.inputBuf) > 0 {
 						tm.inputBuf = tm.inputBuf[:len(tm.inputBuf)-1]
 						tm.clearInputLineLocked()
-						fmt.Printf("0> %s", string(tm.inputBuf))
+						fmt.Printf("%s%s", terminalPrompt, string(tm.inputBuf))
 					}
 					tm.mu.Unlock()
 
